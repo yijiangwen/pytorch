@@ -426,10 +426,6 @@ struct Vectorized<c10::qint8> : public Vectorizedqi {
         vals = _mm512_set1_epi8(uw);
     }
 
-    // This is needed because the compiler emits awful code for the default
-    // constructor for moving the enum
-    Vectorized(const Vectorized<c10::qint8>& other) : Vectorizedqi(other.vals) { }
-
     void store(void* ptr, int count = size()) const {
         if (count != size()) {
             memcpy(ptr, &vals, count * sizeof(value_type));
@@ -586,8 +582,6 @@ struct Vectorized<c10::quint8> : public Vectorizedqi {
         value_type uw = val.val_;
         vals = _mm512_set1_epi8(uw);
     }
-
-    Vectorized(const Vectorized<c10::quint8>& other) : Vectorizedqi(other.vals) { }
 
     void store(void* ptr, int count = size()) const {
         if (count != size()) {
