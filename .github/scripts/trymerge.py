@@ -309,7 +309,6 @@ RE_REVERT_CMD = re.compile(r"@pytorch(merge|)bot\s+revert\s+this")
 RE_REVERT_CMD_CLI = re.compile(r"@pytorch(merge|)bot\s+revert\s+(-m.*-c.*|-c.*-m.*)")
 RE_DIFF_REV = re.compile(r'^Differential Revision:.+?(D[0-9]+)', re.MULTILINE)
 
-
 def _fetch_url(url: str, *,
                headers: Optional[Dict[str, str]] = None,
                data: Optional[Dict[str, Any]] = None,
@@ -329,7 +328,6 @@ def _fetch_url(url: str, *,
             print(f"Rate limit exceeded: {err.headers['X-RateLimit-Used']}/{err.headers['X-RateLimit-Limit']}")
         raise
 
-
 def fetch_json(url: str,
                params: Optional[Dict[str, Any]] = None,
                data: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
@@ -338,6 +336,13 @@ def fetch_json(url: str,
         url += '?' + '&'.join(f"{name}={val}" for name, val in params.items())
     return cast(List[Dict[str, Any]], _fetch_url(url, headers=headers, data=data, reader=json.load))
 
+def fetch_json_dict(url: str,
+                    params: Optional[Dict[str, Any]] = None,
+                    data: Optional[Dict[str, Any]] = None) -> Dict[str, Any] :
+    headers = {'Accept': 'application/vnd.github.v3+json'}
+    if params is not None and len(params) > 0:
+        url += '?' + '&'.join(f"{name}={val}" for name, val in params.items())
+    return cast(Dict[str, Any], _fetch_url(url, headers=headers, data=data, reader=json.load))
 
 def gh_post_comment(org: str, project: str, pr_num: int, comment: str, dry_run: bool = False) -> List[Dict[str, Any]]:
     if dry_run:
@@ -384,7 +389,7 @@ def parse_args() -> Any:
     parser = ArgumentParser("Merge PR into default branch")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--on-green", action="store_true")
-    parser.add_argument("--on-mandatory", action="store_true")
+    parser.add_argument("--land-time-checks", action="store_true")
     parser.add_argument("--revert", action="store_true")
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--comment-id", type=int)
@@ -702,9 +707,24 @@ class GitHubPR:
             msg += f"\nApproved by: {approved_by_urls}\n"
             repo.amend_commit_message(msg)
 
-    def merge_into(self, repo: GitRepo, *, force: bool = False, dry_run: bool = False, comment_id: Optional[int] = None) -> None:
+    def merge_into(self,
+                   repo: GitRepo,
+                   *,
+                   force: bool = False,
+                   dry_run: bool = False,
+                   already_merged: bool = False,
+                   comment_id: Optional[int] = None) -> None:
         # Raises exception if matching rule is not found
         find_matching_merge_rule(self, repo, force=force, skip_internal_checks=can_skip_internal_checks(self, comment_id))
+
+        if not already_merged:
+            self.merge_changes(repo, force, comment_id)
+
+        repo.push(self.default_branch(), dry_run)
+        if not dry_run:
+            gh_add_labels(self.org, self.project, self.pr_num, ["merged"])
+
+    def merge_changes(self, repo: GitRepo, force: bool = False, comment_id: Optional[int] = None) -> None:
         if repo.current_branch() != self.default_branch():
             repo.checkout(self.default_branch())
         if not self.is_ghstack_pr():
@@ -720,9 +740,39 @@ class GitHubPR:
         else:
             self.merge_ghstack_into(repo, force, comment_id=comment_id)
 
-        repo.push(self.default_branch(), dry_run)
-        if not dry_run:
-            gh_add_labels(self.org, self.project, self.pr_num, ["merged"])
+    def create_land_time_check_branch(self, repo: GitRepo) -> str:
+        self.merge_changes(repo, False)
+        branch_name = f'landtime/{self.pr_num}'
+        repo._run_git('checkout', "-b", branch_name)
+        repo._run_git('push', '-u', 'origin', branch_name, '-force')
+        commit = repo.get_commit('HEAD').commit_hash
+        return commit
+
+    def validate_land_time_checks(self, repo: GitRepo, commit: str) -> bool:
+        [owner, name] = repo.gh_owner_and_name()
+        checks = fetch_json_dict(f'https://api.github.com/repos/{owner}/{name}/commits/{commit}/check-runs')
+        if checks['total_count'] == 0:
+            print('There we no checks found for this SHA. They may not have been schedule. Retrying in 60 seconds')
+            time.sleep(60)
+            return False
+        check_runs = checks['check_runs']
+        pending_jobs = []
+        failed_jobs = []
+        for check_run in check_runs:
+            name = check_run['name']
+            conclusion = check_run['conclusion']
+            if conclusion == 'failure':
+                failed_jobs.append(name)
+            elif conclusion is None:
+                pending_jobs.append(name)
+
+        if len(failed_jobs) > 0:
+            raise RuntimeError(f"Failed to merge: some checks failed: {', '.join(failed_jobs)}")
+        if len(pending_jobs) > 0:
+            raise MandatoryChecksMissingError(f"Refusing to merge as mandatory check(s) {', '.join(pending_jobs)} are not yet run")
+        if len(pending_jobs) == 0 and len(failed_jobs) == 0:
+            return True
+        return False
 
 
 class MandatoryChecksMissingError(Exception):
@@ -909,13 +959,11 @@ def prefix_with_github_url(suffix_str: str) -> str:
     return f"https://github.com/{suffix_str}"
 
 
-def merge(pr_num: int, repo: GitRepo,
-          dry_run: bool = False,
-          force: bool = False,
-          comment_id: Optional[int] = None,
-          mandatory_only: bool = False,
-          on_green: bool = False,
-          timeout_minutes: int = 400) -> None:
+def merge_on_green(pr_num: int,
+                   repo: GitRepo,
+                   dry_run: bool = False,
+                   timeout_minutes: int = 400,
+                   land_time_checks: bool = False) -> None:
     repo = GitRepo(get_git_repo_dir(), get_git_remote_name())
     org, project = repo.gh_owner_and_name()
     if force:
@@ -925,22 +973,20 @@ def merge(pr_num: int, repo: GitRepo,
     start_time = time.time()
     last_exception = ''
     elapsed_time = 0.0
+    pr = GitHubPR(org, project, pr_num)
+    if land_time_checks:
+        commit = pr.create_land_time_check_branch(repo)
+
     while elapsed_time < timeout_minutes * 60:
         current_time = time.time()
         elapsed_time = current_time - start_time
-        print(f"Attempting merge of https://github.com/{org}/{project}/pull/{pr_num} ({elapsed_time / 60} minutes elapsed)")
         pr = GitHubPR(org, project, pr_num)
         try:
-            find_matching_merge_rule(pr, repo)
-            pending = pr_get_pending_checks(pr)
-            failing = pr_get_failed_checks(pr)
-            if (not mandatory_only and on_green) and len(failing) > 0:
-                raise RuntimeError(f"{len(failing)} additional jobs have failed, first few of them are: " +
-                                   ' ,'.join(f"[{x[0]}]({x[1]})" for x in failing[:5]))
-            if (not mandatory_only and on_green) and len(pending) > 0:
-                raise MandatoryChecksMissingError(f"Still waiting for {len(pending)} additional jobs to finish, " +
-                                                  f"first few of them are: {' ,'.join(x[0] for x in pending[:5])}")
-            return pr.merge_into(repo, dry_run=dry_run, force=force, comment_id=comment_id)
+            if not land_time_checks:
+                pr.merge_into(repo, dry_run=dry_run)
+            elif land_time_checks and pr.validate_land_time_checks(repo, commit):
+                pr.merge_into(repo, dry_run=dry_run, already_merged=True)
+
         except MandatoryChecksMissingError as ex:
             last_exception = str(ex)
             print(f"Merge of https://github.com/{org}/{project}/pull/{pr_num} failed due to: {ex}. Retrying in 5 min")
@@ -986,16 +1032,20 @@ def main() -> None:
         gh_post_comment(org, project, args.pr_num, "Cross-repo ghstack merges are not supported", dry_run=args.dry_run)
         return
 
-    try:
-        merge(args.pr_num, repo,
-              dry_run=args.dry_run,
-              force=args.force,
-              comment_id=args.comment_id,
-              on_green=args.on_green,
-              mandatory_only=args.on_mandatory)
-    except Exception as e:
-        handle_exception(e)
-
+    if args.on_green:
+        try:
+            merge_on_green(args.pr_num, repo, dry_run=args.dry_run, land_time_checks=args.land_time_checks)
+        except Exception as e:
+            handle_exception(e)
+    else:
+        try:
+            pr.merge_into(repo,
+                          dry_run=args.dry_run,
+                          force=args.force,
+                          comment_id=args.comment_id,
+                          )
+        except Exception as e:
+            handle_exception(e)
 
 
 if __name__ == "__main__":
