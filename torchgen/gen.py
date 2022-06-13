@@ -10,6 +10,7 @@ from dataclasses import dataclass
 import functools
 
 from torchgen.model import (
+    COMPOSITE_DISPATCH_KEYS,
     STRUCTURED_DISPATCH_KEYS,
     Argument,
     DispatchKey,
@@ -2047,6 +2048,23 @@ TORCH_LIBRARY_IMPL(aten, $dispatch_key, m) {
                 )
             else:
                 raise AssertionError(f"unrecognized {dispatch_key} for ufunc")
+
+        if dispatch_key in COMPOSITE_DISPATCH_KEYS:
+            dispatchless = dest.DispatchlessComposite.new(
+                backend_index, grouped_native_functions
+            )
+            fm.write_with_template(
+                f"Dispatchless{dispatch_key}.cpp",
+                "DispatchlessCompositeKernels.cpp",
+                lambda: {
+                    "aggregated_headers": dispatchless.aggregated_headers(),
+                    "operator_headers": dispatchless.operator_headers(),
+                    "kernel_headers": dispatchless.headers(),
+                    "kernel_definitions": list(
+                        mapMaybe(dispatchless.definition, native_functions)
+                    ),
+                },
+            )
 
         del fm
 
