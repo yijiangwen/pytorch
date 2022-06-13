@@ -707,18 +707,23 @@ class GitHubPR:
             msg += f"\nApproved by: {approved_by_urls}\n"
             repo.amend_commit_message(msg)
 
-    def merge_into(self,
-                   repo: GitRepo,
-                   *,
-                   force: bool = False,
-                   dry_run: bool = False,
-                   already_merged: bool = False,
-                   comment_id: Optional[int] = None) -> None:
+    def merge_into(self, repo: GitRepo, *, force: bool = False, dry_run: bool = False, comment_id: Optional[int] = None) -> None:
         # Raises exception if matching rule is not found
         find_matching_merge_rule(self, repo, force=force, skip_internal_checks=can_skip_internal_checks(self, comment_id))
-
-        if not already_merged:
-            self.merge_changes(repo, force, comment_id)
+        if repo.current_branch() != self.default_branch():
+            repo.checkout(self.default_branch())
+        if not self.is_ghstack_pr():
+            # Adding the url here makes it clickable within the Github UI
+            approved_by_urls = ', '.join(prefix_with_github_url(login) for login in self.get_approved_by())
+            msg = self.get_title() + f" (#{self.pr_num})\n\n" + self.get_body()
+            msg += f"\nPull Request resolved: {self.get_pr_url()}\n"
+            msg += f"Approved by: {approved_by_urls}\n"
+            pr_branch_name = f"__pull-request-{self.pr_num}__init__"
+            repo.fetch(f"pull/{self.pr_num}/head", pr_branch_name)
+            repo._run_git("merge", "--squash", pr_branch_name)
+            repo._run_git("commit", f"--author=\"{self.get_author()}\"", "-m", msg)
+        else:
+            self.merge_ghstack_into(repo, force, comment_id=comment_id)
 
         repo.push(self.default_branch(), dry_run)
         if not dry_run:
@@ -959,11 +964,13 @@ def prefix_with_github_url(suffix_str: str) -> str:
     return f"https://github.com/{suffix_str}"
 
 
-def merge_on_green(pr_num: int,
-                   repo: GitRepo,
-                   dry_run: bool = False,
-                   timeout_minutes: int = 400,
-                   land_time_checks: bool = False) -> None:
+def merge(pr_num: int, repo: GitRepo,
+          dry_run: bool = False,
+          force: bool = False,
+          comment_id: Optional[int] = None,
+          mandatory_only: bool = False,
+          on_green: bool = False,
+          timeout_minutes: int = 400) -> None:
     repo = GitRepo(get_git_repo_dir(), get_git_remote_name())
     org, project = repo.gh_owner_and_name()
     if force:
@@ -973,20 +980,22 @@ def merge_on_green(pr_num: int,
     start_time = time.time()
     last_exception = ''
     elapsed_time = 0.0
-    pr = GitHubPR(org, project, pr_num)
-    if land_time_checks:
-        commit = pr.create_land_time_check_branch(repo)
-
     while elapsed_time < timeout_minutes * 60:
         current_time = time.time()
         elapsed_time = current_time - start_time
+        print(f"Attempting merge of https://github.com/{org}/{project}/pull/{pr_num} ({elapsed_time / 60} minutes elapsed)")
         pr = GitHubPR(org, project, pr_num)
         try:
-            if not land_time_checks:
-                pr.merge_into(repo, dry_run=dry_run)
-            elif land_time_checks and pr.validate_land_time_checks(repo, commit):
-                pr.merge_into(repo, dry_run=dry_run, already_merged=True)
-
+            find_matching_merge_rule(pr, repo)
+            pending = pr_get_pending_checks(pr)
+            failing = pr_get_failed_checks(pr)
+            if (not mandatory_only and on_green) and len(failing) > 0:
+                raise RuntimeError(f"{len(failing)} additional jobs have failed, first few of them are: " +
+                                   ' ,'.join(f"[{x[0]}]({x[1]})" for x in failing[:5]))
+            if (not mandatory_only and on_green) and len(pending) > 0:
+                raise MandatoryChecksMissingError(f"Still waiting for {len(pending)} additional jobs to finish, " +
+                                                  f"first few of them are: {' ,'.join(x[0] for x in pending[:5])}")
+            return pr.merge_into(repo, dry_run=dry_run, force=force, comment_id=comment_id)
         except MandatoryChecksMissingError as ex:
             last_exception = str(ex)
             print(f"Merge of https://github.com/{org}/{project}/pull/{pr_num} failed due to: {ex}. Retrying in 5 min")
@@ -1032,20 +1041,15 @@ def main() -> None:
         gh_post_comment(org, project, args.pr_num, "Cross-repo ghstack merges are not supported", dry_run=args.dry_run)
         return
 
-    if args.on_green:
-        try:
-            merge_on_green(args.pr_num, repo, dry_run=args.dry_run, land_time_checks=args.land_time_checks)
-        except Exception as e:
-            handle_exception(e)
-    else:
-        try:
-            pr.merge_into(repo,
-                          dry_run=args.dry_run,
-                          force=args.force,
-                          comment_id=args.comment_id,
-                          )
-        except Exception as e:
-            handle_exception(e)
+    try:
+        merge(args.pr_num, repo,
+            dry_run=args.dry_run,
+            force=args.force,
+            comment_id=args.comment_id,
+            on_green=args.on_green,
+            mandatory_only=args.on_mandatory)
+    except Exception as e:
+        handle_exception(e)
 
 
 if __name__ == "__main__":
