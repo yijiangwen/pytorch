@@ -234,6 +234,10 @@ at::Tensor PackedLinearWeight::apply_dynamic_relu(
 template <bool ReluFused>
 at::Tensor PackedLinearWeightsQnnp::apply_dynamic_impl(
     at::Tensor input) {
+  if (reduce_range) {
+    TORCH_WARN("Currently, qnnpack incorrectly ignores reduce_range when it is set to true; this may change in a future release.");
+  }
+
   using at::Tensor;
   TORCH_CHECK(
       input.dim() >= 2,
