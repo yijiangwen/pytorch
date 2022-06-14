@@ -3896,7 +3896,7 @@ class TestQuantizeFx(QuantizationTestCase):
         # make sure the arg[1] of lstm module is a tuple
         for n in m.graph.nodes:
             if n.target == "lstm":
-                self.assertEqual(type(n.args[1]), tuple)
+                self.assertEqual(type(n.kwargs["hx"]), tuple)
 
     def test_relu_lowering(self):
         class M(torch.nn.Module):
@@ -4584,6 +4584,46 @@ class TestQuantizeFx(QuantizationTestCase):
         _test(prepare_fx, get_default_qconfig_dict())
         _test(prepare_qat_fx, get_default_qat_qconfig_dict())
 
+    def test_normalize_args(self):
+        class M1(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.w = torch.randn(1, 1)
+                self.b = torch.randn(1)
+
+            def forward(self, x):
+                x = F.linear(x, weight=self.w, bias=self.b)
+                x = F.linear(x, weight=self.w)
+                return x
+
+        m = M1().eval()
+        example_inputs = (torch.randn(1, 1),)
+        qconfig_dict = {'': torch.ao.quantization.default_qconfig}
+        mp = prepare_fx(m, qconfig_dict, example_inputs)
+        mq = convert_fx(mp)
+        # make sure it runs
+        mq(*example_inputs)
+
+        # in torch/fx/operator_schemas.py, we matched two schemas for conv2d
+        # because we are using Proxy so no schema was matched
+        # class M2(nn.Module):
+        #     def __init__(self):
+        #         super().__init__()
+        #         self.w = torch.randn(1, 1, 1, 1)
+        #         self.b = torch.randn(1)
+
+        #     def forward(self, x):
+        #         x = F.conv2d(x, weight=self.w, bias=self.b)
+        #         return x
+
+        # m = M2().eval()
+        # example_inputs = (torch.randn(1, 1, 3, 3),)
+        # qconfig_dict = {'': torch.ao.quantization.default_qconfig}
+        # mp = prepare_fx(m, qconfig_dict, example_inputs)
+        # mq = convert_fx(mp)
+        # # make sure it runs
+        # mq(*example_inputs)
+
 @skipIfNoFBGEMM
 class TestQuantizeFxOps(QuantizationTestCase):
     def setUp(self):
@@ -5146,8 +5186,7 @@ class TestQuantizeFxOps(QuantizationTestCase):
         for is_inplace_op, relu_callable, is_scalar in options:
             model = BinaryOpRelu(
                 binary_op, ibinary_op, is_inplace_op, relu_callable, is_scalar)
-            self.checkGraphModeFxOp(
-                model, data, quant_type, quantized_node)
+            self.checkGraphModeFxOp(model, data, quant_type, quantized_node)
 
     def _test_binary_op_relu_float16_impl(self, binary_op, ibinary_op):
         data = (torch.rand((1, 1, 1, 1), dtype=torch.float),
@@ -5255,9 +5294,14 @@ class TestQuantizeFxOps(QuantizationTestCase):
         #     print_debug_info=True)
 
     @skipIfNoFBGEMM
-    def test_add_relu(self):
+    def test_add_relu_int8(self):
+        # TODO: split this further to smaller tests, maybe with
+        # torch.testing._internal.common_utils.parameterize
         self._test_binary_op_relu_int8_impl(
             operator.add, operator.iadd, torch.ops.quantized.add_relu)
+
+    @skipIfNoFBGEMM
+    def test_add_relu_fp16(self):
         self._test_binary_op_relu_float16_impl(
             operator.add, operator.iadd)
 
@@ -7224,9 +7268,16 @@ class TestQuantizeFxModels(QuantizationTestCase):
                     self.emb = torch.nn.EmbeddingBag(num_embeddings=10, embedding_dim=12, mode='sum')
                     self.linear = torch.nn.Linear(12, 1).to(dtype=torch.float)
 
-                def forward(self, input: torch.Tensor, offsets: Optional[torch.Tensor] = None,
-                            per_sample_weights: Optional[torch.Tensor] = None):
-                    x = self.emb(input, offsets, per_sample_weights)
+                # Note: this does not work since the result is not scriptable
+                # because of these additional optional args
+                # def forward(self, input: torch.Tensor, offsets: Optional[torch.Tensor] = None,
+                #             per_sample_weights: Optional[torch.Tensor] = None):
+                #     x = self.emb(input, offsets, per_sample_weights)
+                #     x = self.linear(x)
+                #     return x
+
+                def forward(self, input: torch.Tensor):
+                    x = self.emb(input)
                     x = self.linear(x)
                     return x
 
@@ -7245,15 +7296,14 @@ class TestQuantizeFxModels(QuantizationTestCase):
 
             def checkQuantized(model):
                 # Make sure EmbeddingBag is now a quantized EmbeddingBag.
-                self.assertTrue(type(model.emb), nn.quantized.EmbeddingBag)
+                self.assertEqual(type(model.emb), nn.quantized.EmbeddingBag)
                 # Also test that Linear has been quantized.
-                self.assertTrue(type(model.linear), nnq.Linear)
+                self.assertEqual(type(model.linear), nnq.Linear)
 
                 test_only_eval_fn(model, eval_output)
                 self.checkScriptable(model, eval_output)
                 self.checkNoQconfig(model)
             checkQuantized(quant_model)
-
 
     @override_qengines
     def test_qat_embedding_linear(self):
