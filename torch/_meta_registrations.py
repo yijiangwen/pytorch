@@ -3,10 +3,22 @@ from torch import Tensor
 from torch._prims import utils
 from torch._prims.utils import check
 from torch._prims.wrappers import out_wrapper_multi, out_wrapper
+from torch.utils._pytree import tree_map
 
 from typing import List, Optional
+aten = torch.ops.aten
 
 meta_lib = torch.library.Library("aten", "IMPL", "Meta")
+meta_funcs = {}
+def register_meta(op):
+    def wrapper(f):
+        def add_func(op):
+            meta_funcs[op] = f
+            name = op.__name__ if op._overloadname != 'default' else op.overloadpacket.__name__
+            meta_lib.impl(name, f)
+        tree_map(add_func, op)
+        return f
+    return wrapper
 
 def toRealValueType(dtype):
     from_complex = {
@@ -16,26 +28,35 @@ def toRealValueType(dtype):
     }
     return from_complex.get(dtype, dtype)
 
+
 # Implementations below are taken from https://github.com/albanD/subclass_zoo/blob/main/python_meta_tensor.py
-@torch.library.impl(meta_lib, "index_select")
+@register_meta(aten.index_select.default)
 def meta_index_select(self, dim, index):
     result_size = list(self.size())
     if self.dim() > 0:
         result_size[dim] = index.numel()
     return self.new_empty(result_size)
 
-@torch.library.impl(meta_lib, "index_select.out")
+@register_meta(aten.index_select.out)
 def meta_index_select_out(self, dim, index, out):
     torch._resize_output_(out, self.size(), self.device)
     return out.copy_(torch.index_select(self, dim, index))
 
-@torch.library.impl(meta_lib, "max")
+@register_meta(aten.max.default)
 def meta_max(self):
     return self.new_empty(())
 
-@torch.library.impl(meta_lib, "min")
+@register_meta(aten.min.default)
 def meta_min(self):
     return self.new_empty(())
+
+@register_meta(aten.sum.default)
+def sum_meta(x):
+    return x.new_empty(())
+
+@register_meta(aten.expand.SymInt)
+def expand_symint_meta(a, size, implicit=False):
+    return a.new_empty(size)
 
 def squareCheckInputs(self, f_name):
     assert self.dim() >= 2, f"{f_name}: The input tensor must have at least 2 dimensions."
@@ -47,7 +68,7 @@ def checkUplo(uplo: str):
     assert len(uplo) == 1 and uplo_uppercase == 'U' or uplo_uppercase == 'L', \
         f"Expected UPLO argument to be 'L' or 'U', but got {uplo}"
 
-@torch.library.impl(meta_lib, "linalg_eigh")
+@register_meta(aten.linalg_eigh.default)
 def meta_linalg_eigh(self, uplo="L"):
     squareCheckInputs(self, "linalg_eigh")
     checkUplo(uplo)
@@ -58,7 +79,8 @@ def meta_linalg_eigh(self, uplo="L"):
     vectors = self.new_empty(self.shape[:-1])
     return (values, vectors)
 
-@torch.library.impl(meta_lib, "reflection_pad2d")
+
+@register_meta(aten.reflection_pad2d.default)
 def meta_pad2d(self, padding):
     valid_dims = self.size(1) != 0 and self.size(2) != 0
     check(
@@ -82,7 +104,7 @@ def meta_pad2d(self, padding):
     else:
         return self.new_empty((nbatch, nplane, output_h, output_w))
 
-@torch.library.impl(meta_lib, "dot")
+@register_meta(aten.dot.default)
 def meta_dot(self, tensor):
     check(
         self.dim() == 1 and tensor.dim() == 1,
@@ -169,7 +191,7 @@ def meta_linalg_qr_helper(input, mode):
     R.transpose_(-2, -1)
     return (Q, R)
 
-@torch.library.impl(meta_lib, "index.Tensor")
+@register_meta(aten.index.Tensor)
 def meta_index_Tensor(self, indices):
     check(indices, lambda: "at least one index must be provided")
     # aten::index is the internal advanced indexing implementation
