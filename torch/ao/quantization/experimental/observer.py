@@ -29,7 +29,7 @@ class APoTObserver(ObserverBase):
         self.b = b
         self.k = k
 
-    def calculate_qparams(self, signed):
+    def calculate_qparams(self, signed) -> Tuple:
         return self._calculate_qparams(signed)
 
     r""" Calculates nonuniform quantization parameters given min and max value tensors.
@@ -146,9 +146,10 @@ def float_to_apot(x, levels, indices):
 
     return best_idx
 
-r"""Converts int4 APoT2 input into floating point number
+r"""Converts int4 APoT2 tensor input into floating point number
 based on quantization levels
 """
 def apot_to_float(x_apot, levels, indices):
-    idx = list(indices).index(x_apot)
+    x = x_apot.numpy()
+    idx = list(indices).index(x)
     return levels[idx]
